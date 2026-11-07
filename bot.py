@@ -49,7 +49,11 @@ TZ = ZoneInfo(TIMEZONE)
 SUPPORTED = {"text", "photo", "video", "sticker", "animation",
              "document", "audio", "voice", "video_note"}
 CAPTIONABLE = {"photo", "video", "animation", "document", "audio", "voice"}
-LABELS = {"sticker": "ملصق", "video_note": "رسالة فيديو"}
+LABELS = {
+    "sticker": "ملصق", "video_note": "رسالة فيديو", "photo": "صورة",
+    "video": "فيديو", "animation": "GIF", "document": "ملف",
+    "audio": "ملف صوتي", "voice": "رسالة صوتية",
+}
 
 
 # ───────────── قاعدة البيانات ─────────────
@@ -151,11 +155,25 @@ MSG_META = {
     "sent_ok": ("✅ رسالة تأكيد الإرسال", "✅ تم إرسال رسالتك بشكل مجهول."),
     "unsupported": ("🚫 رسالة النوع غير المدعوم", "⚠️ هذا النوع من الرسائل غير مدعوم."),
     "error": ("❌ رسالة الخطأ", "❌ حدث خطأ أثناء الإرسال، حاول لاحقاً."),
+    "new_title": ("💌 عنوان الرسالة الواصلة إليك", "💌 وصلتك رسالة جديدة"),
+    "footer": ("📝 السطر الأخير أسفل الرسالة الواصلة (فارغ = بدون)", ""),
 }
 
 
 def get_msg(key: str) -> str:
     return db.get_setting("msg:" + key) or MSG_META[key][1]
+
+
+def build(body_html: str) -> str:
+    """شكل الرسالة الثانية التي تصل للمالك."""
+    now = datetime.now(TZ).strftime("%Y/%m/%d - %I:%M:%S %p")
+    text = "\n".join(
+        [get_msg("new_title"), f"⏱ وقت الرسالة: {now}", "----", body_html, "----"]
+    )
+    footer = get_msg("footer")
+    if footer:
+        text += "\n\n" + footer
+    return text
 
 
 # ───────────── أدوات مساعدة ─────────────
@@ -333,7 +351,7 @@ async def cb_msg_pick(c: CallbackQuery, state: FSMContext):
     await state.update_data(key=key)
     await safe_edit(
         c,
-        f"{MSG_META[key][0]}\n\n<b>النص الحالي:</b>\n{get_msg(key)}\n\n"
+        f"{MSG_META[key][0]}\n\n<b>النص الحالي:</b>\n{get_msg(key) or "(فارغ)"}\n\n"
         "✍️ أرسل النص الجديد الآن (يدعم التنسيق: عريض، مائل...).",
         kb_of(
             [btn("↩️ استعادة الافتراضي", f"msgreset:{key}")],
@@ -351,7 +369,7 @@ async def cb_msg_reset(c: CallbackQuery, state: FSMContext):
         await state.clear()
         await safe_edit(
             c,
-            "↩️ تمت استعادة النص الافتراضي:\n\n" + get_msg(key),
+            "↩️ تمت استعادة النص الافتراضي:\n\n" + (get_msg(key) or "(فارغ)"),
             kb_of([btn("⬅️ رجوع", "set:msgs")]),
         )
     await c.answer("تمت الاستعادة")
@@ -509,7 +527,6 @@ async def user_message(m: Message):
         f"🆔 الأيدي: <code>{uid}</code>\n"
         f"🔗 اليوزر: {html.escape(uname)}"
     )
-    header = f"📩 رسالة جديدة الساعة {datetime.now(TZ).strftime('%H:%M:%S')}"
 
     try:
         info_msg = await bot.send_message(OWNER_ID, info)
@@ -517,14 +534,17 @@ async def user_message(m: Message):
         reply_to = ReplyParameters(message_id=info_msg.message_id)
 
         if ct == "text":
-            body = fit(m.text, 3800)
+            body = fit(m.text, max(4000 - len(build("")), 100))
             sent = await bot.send_message(
-                OWNER_ID, f"{header}\n\nنص الرسالة:\n{body}", reply_parameters=reply_to
+                OWNER_ID, build(body), reply_parameters=reply_to
             )
             db.map(sent.message_id, uid)
         elif ct in CAPTIONABLE:
-            caption_text = fit(m.caption, 800) if m.caption else "—"
-            cap = f"{header}\n\nنص الرسالة:\n{caption_text}"
+            if m.caption:
+                caption_text = fit(m.caption, max(1000 - len(build("")), 0))
+            else:
+                caption_text = f"({LABELS.get(ct, ct)})"
+            cap = build(caption_text)
             r = await m.copy_to(
                 OWNER_ID, caption=cap, parse_mode=ParseMode.HTML, reply_parameters=reply_to
             )
@@ -532,7 +552,7 @@ async def user_message(m: Message):
         else:  # ملصق / رسالة فيديو لا تدعم تعليقاً
             label = LABELS.get(ct, ct)
             sent = await bot.send_message(
-                OWNER_ID, f"{header}\n\nنص الرسالة: ({label})", reply_parameters=reply_to
+                OWNER_ID, build(f"({label})"), reply_parameters=reply_to
             )
             db.map(sent.message_id, uid)
             r = await m.copy_to(
