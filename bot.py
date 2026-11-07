@@ -20,6 +20,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReplyParameters,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -143,6 +144,19 @@ class DB:
 
 db = DB(DB_PATH)
 
+# الرسائل الثابتة القابلة للتعديل من المالك
+MSG_META = {
+    "welcome": ("👋 رسالة الترحيب", WELCOME_TEXT),
+    "need_link": ("⚠️ رسالة طلب الرابط الخاص", NEED_LINK_TEXT),
+    "sent_ok": ("✅ رسالة تأكيد الإرسال", "✅ تم إرسال رسالتك بشكل مجهول."),
+    "unsupported": ("🚫 رسالة النوع غير المدعوم", "⚠️ هذا النوع من الرسائل غير مدعوم."),
+    "error": ("❌ رسالة الخطأ", "❌ حدث خطأ أثناء الإرسال، حاول لاحقاً."),
+}
+
+
+def get_msg(key: str) -> str:
+    return db.get_setting("msg:" + key) or MSG_META[key][1]
+
 
 # ───────────── أدوات مساعدة ─────────────
 _bot_username = None
@@ -195,6 +209,7 @@ def home_kb():
         [btn("🔗 رابطي الخاص", "set:link"), btn("♻️ تجديد الرابط", "set:newlink")],
         [btn("🚫 حظر بالأيدي", "set:block"), btn("✅ رفع حظر بالأيدي", "set:unblock")],
         [btn("📋 قائمة المحظورين", "set:list")],
+        [btn("✏️ تعديل الرسائل", "set:msgs")],
     )
 
 
@@ -215,6 +230,7 @@ async def home_text(bot: Bot) -> str:
 class S(StatesGroup):
     block = State()
     unblock = State()
+    edit = State()
 
 
 # ───────────── راوتر المالك ─────────────
@@ -292,6 +308,71 @@ async def cb_list(c: CallbackQuery):
     text, kb = list_view()
     await safe_edit(c, text, kb)
     await c.answer()
+
+
+@owner.callback_query(F.data == "set:msgs")
+async def cb_msgs(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rows = [[btn(label, f"msg:{key}")] for key, (label, _) in MSG_META.items()]
+    rows.append([btn("⬅️ رجوع", "set:home")])
+    await safe_edit(
+        c,
+        "✏️ <b>تعديل الرسائل</b>\n\nاختر الرسالة التي تريد تغييرها:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await c.answer()
+
+
+@owner.callback_query(F.data.startswith("msg:"))
+async def cb_msg_pick(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":", 1)[1]
+    if key not in MSG_META:
+        await c.answer()
+        return
+    await state.set_state(S.edit)
+    await state.update_data(key=key)
+    await safe_edit(
+        c,
+        f"{MSG_META[key][0]}\n\n<b>النص الحالي:</b>\n{get_msg(key)}\n\n"
+        "✍️ أرسل النص الجديد الآن (يدعم التنسيق: عريض، مائل...).",
+        kb_of(
+            [btn("↩️ استعادة الافتراضي", f"msgreset:{key}")],
+            [btn("⬅️ رجوع", "set:msgs")],
+        ),
+    )
+    await c.answer()
+
+
+@owner.callback_query(F.data.startswith("msgreset:"))
+async def cb_msg_reset(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":", 1)[1]
+    if key in MSG_META:
+        db.q("DELETE FROM settings WHERE key=?", ("msg:" + key,))
+        await state.clear()
+        await safe_edit(
+            c,
+            "↩️ تمت استعادة النص الافتراضي:\n\n" + get_msg(key),
+            kb_of([btn("⬅️ رجوع", "set:msgs")]),
+        )
+    await c.answer("تمت الاستعادة")
+
+
+@owner.message(S.edit)
+async def do_edit(m: Message, state: FSMContext):
+    key = (await state.get_data()).get("key")
+    if key not in MSG_META or not m.text:
+        await m.answer("❌ أرسل نصاً فقط.")
+        return
+    new = m.html_text
+    if len(new) > 3500:
+        await m.answer("❌ النص طويل جداً، اختصره قليلاً.")
+        return
+    db.set_setting("msg:" + key, new)
+    await state.clear()
+    await m.answer(
+        f"✅ تم تحديث «{MSG_META[key][0]}»:\n\n{new}",
+        reply_markup=kb_of([btn("⬅️ رجوع", "set:msgs")]),
+    )
 
 
 @owner.message(S.block)
@@ -399,10 +480,10 @@ async def user_start(m: Message, command: CommandObject):
     if payload and payload == get_code():
         db.allow(uid)
     if REQUIRE_LINK and not db.is_allowed(uid):
-        await m.answer(NEED_LINK_TEXT)
+        await m.answer(get_msg("need_link"))
         return
     db.upsert_user(m.from_user)
-    await m.answer(WELCOME_TEXT)
+    await m.answer(get_msg("welcome"))
 
 
 @users.message()
@@ -412,12 +493,12 @@ async def user_message(m: Message):
     if db.is_blocked(uid):
         return
     if REQUIRE_LINK and not db.is_allowed(uid):
-        await m.answer(NEED_LINK_TEXT)
+        await m.answer(get_msg("need_link"))
         return
 
     ct = str(getattr(m.content_type, "value", m.content_type))
     if ct not in SUPPORTED:
-        await m.answer("⚠️ هذا النوع من الرسائل غير مدعوم.")
+        await m.answer(get_msg("unsupported"))
         return
 
     db.upsert_user(u)
@@ -431,30 +512,39 @@ async def user_message(m: Message):
     header = f"📩 رسالة جديدة الساعة {datetime.now(TZ).strftime('%H:%M:%S')}"
 
     try:
-        sent = await bot.send_message(OWNER_ID, info)
-        db.map(sent.message_id, uid)
+        info_msg = await bot.send_message(OWNER_ID, info)
+        db.map(info_msg.message_id, uid)
+        reply_to = ReplyParameters(message_id=info_msg.message_id)
 
         if ct == "text":
             body = fit(m.text, 3800)
-            sent = await bot.send_message(OWNER_ID, f"{header}\n\nنص الرسالة:\n{body}")
+            sent = await bot.send_message(
+                OWNER_ID, f"{header}\n\nنص الرسالة:\n{body}", reply_parameters=reply_to
+            )
             db.map(sent.message_id, uid)
         elif ct in CAPTIONABLE:
             caption_text = fit(m.caption, 800) if m.caption else "—"
             cap = f"{header}\n\nنص الرسالة:\n{caption_text}"
-            r = await m.copy_to(OWNER_ID, caption=cap, parse_mode=ParseMode.HTML)
+            r = await m.copy_to(
+                OWNER_ID, caption=cap, parse_mode=ParseMode.HTML, reply_parameters=reply_to
+            )
             db.map(r.message_id, uid)
         else:  # ملصق / رسالة فيديو لا تدعم تعليقاً
             label = LABELS.get(ct, ct)
-            sent = await bot.send_message(OWNER_ID, f"{header}\n\nنص الرسالة: ({label})")
+            sent = await bot.send_message(
+                OWNER_ID, f"{header}\n\nنص الرسالة: ({label})", reply_parameters=reply_to
+            )
             db.map(sent.message_id, uid)
-            r = await m.copy_to(OWNER_ID)
+            r = await m.copy_to(
+                OWNER_ID, reply_parameters=ReplyParameters(message_id=sent.message_id)
+            )
             db.map(r.message_id, uid)
     except Exception:
         log.exception("failed to deliver message")
-        await m.answer("❌ حدث خطأ أثناء الإرسال، حاول لاحقاً.")
+        await m.answer(get_msg("error"))
         return
 
-    await m.answer("✅ تم إرسال رسالتك بشكل مجهول.")
+    await m.answer(get_msg("sent_ok"))
 
 
 # ───────────── التشغيل ─────────────
